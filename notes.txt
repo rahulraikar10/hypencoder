@@ -1,0 +1,140 @@
+Three answers:
+
+**1. Point to a specific folder**
+```bash
+cd /your/typescript/project/src
+code-review-graph build
+```
+Just `cd` into the folder first. The graph gets stored in `.code-review-graph/graph.db` inside that folder.
+
+**2. Nested folders — handled automatically**
+It recursively walks all subdirectories. So if your structure is:
+```
+src/
+  camera/
+    switchLens.ts
+  auth/
+    login.ts
+  utils/
+    commonUtils.ts
+```
+All of it gets indexed. No extra config needed.
+
+**3. Only `.ts` files**
+In git repos, only tracked files are indexed via `git ls-files`, so gitignored files are skipped automatically. To exclude everything that isn't `.ts`, create a `.code-review-graphignore` file in your project root:
+
+```
+# exclude everything
+**/*
+
+# but allow .ts files
+!**/*.ts
+```
+
+Or more practically, just exclude the file types you don't want:
+```
+**/*.json
+**/*.md
+**/*.yaml
+**/*.yml
+**/*.js        # if you only want .ts not .js
+node_modules/**
+dist/**
+build/**
+```
+
+It uses `.gitignore` syntax to exclude files from parsing. Common directories like `node_modules`, `.git`, and `__pycache__` are ignored by default.
+
+
+---
+
+
+import subprocess
+import json
+import anthropic
+
+# ── PLACEHOLDERS ──────────────────────────────────────────────────────────────
+REPO_PATH = "/path/to/your/typescript/project"
+API_KEY   = "YOUR_API_KEY_HERE"
+MODEL     = "claude-sonnet-4-6"
+TOP_K     = 5
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": { "repo_root": REPO_PATH, **arguments }
+        }
+    }
+    result = subprocess.run(
+        ["code-review-graph", "serve", "--repo", REPO_PATH],
+        input=json.dumps(request),
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+    return json.loads(result.stdout).get("result", {})
+
+
+def answer_question(question: str) -> str:
+
+    # Step 1: semantic search → top-k matching nodes
+    search   = call_mcp_tool("semantic_search_nodes_tool", { "query": question, "top_k": TOP_K })
+    seed_ids = [n["id"] for n in search.get("nodes", [])]
+
+    # Step 2: graph expansion → callers + callees of each seed
+    expanded_ids = set(seed_ids)
+    for node_id in seed_ids:
+        for query_type in ["callees_of", "callers_of"]:
+            result = call_mcp_tool("query_graph_tool", { "node_id": node_id, "query_type": query_type, "depth": 1 })
+            for n in result.get("nodes", []):
+                expanded_ids.add(n["id"])
+
+    # Step 3: fetch full code bodies for all relevant nodes
+    context = call_mcp_tool("get_review_context_tool", { "node_ids": list(expanded_ids) })
+    chunks  = context.get("context", [])
+
+    # Step 4: send to LLM
+    context_text = "\n\n".join([f"--- {c['file']} | {c['name']} ---\n{c['code']}" for c in chunks])
+    prompt = f"""You are a code assistant. Answer using only the code context below.
+
+Context:
+{context_text}
+
+Question: {question}
+Answer:"""
+
+    client  = anthropic.Anthropic(api_key=API_KEY)
+    message = client.messages.create(model=MODEL, max_tokens=1024, messages=[{ "role": "user", "content": prompt }])
+    return message.content[0].text
+
+
+# ── test it ───────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    question = "how does lens switching work?"
+    print(answer_question(question))
+
+
+
+--- RUN ---
+
+
+pip install anthropic code-review-graph
+code-review-graph build   # one time
+python pipeline.py        # test it
+
+
+
+
+
+
+
+
+
+
+
