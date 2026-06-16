@@ -59,3 +59,50 @@ export default switchLensInCameraApp
 ```
 
 That's the whole function in 10 lines. Every decision point is visible, every error code is named, nothing important is lost.
+
+
+Analyze this TypeScript file from a Bixby capsule/agent codebase.
+Split it into logical chunks for a semantic search system.
+
+FILE PATH: {file path}
+
+FILE CONTENT:
+{file content}
+
+CHUNKING RULES:
+- One chunk per function/method
+- Group all types/interfaces into one chunk if present
+- Skip imports, single lines, empty blocks
+- Include export at bottom of its function chunk
+
+CODE CONDENSING RULES (for functions >= 15 lines):
+- Keep: core logic, key function calls, return values, error codes, important constants
+- Collapse into one comment: null/undefined guard blocks, repetitive param extractions
+- Remove: commented-out code, redundant variable assignments, obvious boilerplate
+- Target: 10-20 lines per code block
+
+FOLDING RULES (apply inside every condensed code block):
+- if/else chains → // if {condition} → {outcome} | else → {outcome}
+- nested if blocks → // checks: step1 → step2 → step3
+- switch statements → // switch(var): caseA→result | caseB→result
+- try/catch → // try: {what} | catch: {error returned}
+- any conditional block > 3 lines → fold to one comment line
+- fold comments must be one line, tight, no fluff
+
+INNER FUNCTION RULES:
+- Inner functions/closures defined inside another function:
+  - If < 15 lines → fold to one comment inside the outer chunk:
+    // inner fn {name}({params}) → {what it does}
+  - If >= 15 lines OR does something distinct → make it its own chunk,
+    reference it in the outer chunk as:
+    // calls {name}() → see chunk: {chunk_name}
+- Never leave inner function bodies expanded inside an outer chunk
+
+OUTPUT — only this format, one block per chunk, separated by ---:
+
+## CHUNK: {snake_case_name}
+**File:** {file_path}
+**Summary:** {what it does} | {inputs} | {outputs/return} | {key calls or error codes}
+
+```ts
+{condensed + folded code}
