@@ -8,12 +8,15 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-LLM_MODEL = 'qwen:3.5:9B'
+# FIX: model string updated to match the actual model ID reported by /v1/models.
+# llama.cpp ignores this field and uses whatever is loaded, but keeping it
+# accurate avoids confusion when reading logs.
+LLM_MODEL = 'Qwen3.5-9B-Q8_0.gguf'
 
 client = openai.OpenAI(
     base_url="http://107.109.107.68:8080/v1",
     api_key="sk-no-key-required",
-    timeout=600.0,          # FIX: was never applied before — caused silent hangs
+    timeout=600.0,
 )
 
 CAPSULE_NAME = 'bigOven'
@@ -120,17 +123,19 @@ def find_ts_files(dir_path, file_list=None):
 # ─── LLM call ─────────────────────────────────────────────────────────────────
 def call_llm(prompt: str, file_label: str = '') -> str:
     """
-    Call the llama.cpp server via chat completions (not legacy completions).
+    Call the llama.cpp server via chat completions.
 
-    FIX 1: switched from client.completions.create  →  client.chat.completions.create
-            Instruction-tuned models (Qwen, etc.) need the chat template applied;
-            the bare /v1/completions endpoint skips it, causing garbled/ignored output.
+    FIX (thinking mode): Qwen3 ships with chain-of-thought thinking enabled by
+    default. When active, the model writes all output to `reasoning_content` and
+    leaves `content` empty — so the caller receives an empty string regardless of
+    how many tokens are generated. Diagnosed via /v1/chat/completions returning
+        {"content": "", "reasoning_content": "Thinking Process: ..."}
+    Fix: pass `enable_thinking: false` through llama.cpp's `chat_template_kwargs`
+    so the model skips the <think> block and writes directly to `content`.
 
-    FIX 2: timeout is set on the client constructor (above), not here — openai-python
-            applies it globally.  No need to pass it per-call.
-
-    FIX 3: model string is passed as-is; llama.cpp ignores it and uses whatever
-            model is loaded, but it must be a non-empty string.
+    Fallback: if `content` is still empty after the request (e.g. a future model
+    version or server config that ignores the kwarg), extract `reasoning_content`
+    rather than silently returning ''.
     """
     last_error = None
 
@@ -145,10 +150,27 @@ def call_llm(prompt: str, file_label: str = '') -> str:
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=4096,
                 temperature=0,
+                # FIX: disable Qwen3 thinking mode so output goes to `content`,
+                # not `reasoning_content`. Passed as a raw body field via
+                # extra_body; llama.cpp forwards it to the chat template renderer.
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
 
             elapsed = time.time() - t0
-            result = response.choices[0].message.content or ''
+
+            msg = response.choices[0].message
+            result = (msg.content or '').strip()
+
+            # FIX: fallback — if content is still empty, pull from reasoning_content.
+            # This should not happen once enable_thinking=False is respected, but
+            # keeps the pipeline alive if the server ignores the kwarg.
+            if not result:
+                reasoning = getattr(msg, 'reasoning_content', None) or ''
+                if reasoning:
+                    result = reasoning.strip()
+                    tqdm.write('    [LLM] ⚠ content was empty; fell back to '
+                               'reasoning_content (thinking mode still active?)')
+
             finish = response.choices[0].finish_reason
             tok_in = getattr(response.usage, 'prompt_tokens', '?')
             tok_out = getattr(response.usage, 'completion_tokens', '?')
@@ -198,15 +220,9 @@ def call_llm(prompt: str, file_label: str = '') -> str:
 def parse_chunks_from_response(response: str, file_path: str) -> list[dict]:
     """
     Parse LLM response into a list of chunk dicts.
-
-    FIX: the old regex split was fragile — alternation stripped the ## CHUNK:
-         prefix on the first element in some cases, and '\\n---\\n\\n## CHUNK:'
-         never matched when the separator was on its own line.
-         Now we just findall all chunk blocks directly.
     """
     chunks = []
 
-    # Find every block starting with ## CHUNK: up to the next ## CHUNK: or end-of-string
     raw_blocks = re.split(r'(?=## CHUNK:)', response)
 
     for block in raw_blocks:
@@ -288,7 +304,25 @@ def process_file(file_path: str) -> tuple[str, list[dict]]:
 
 # ─── Output helpers ───────────────────────────────────────────────────────────
 def generate_chunk_id(file_path: str, chunk_name: str) -> str:
+    """Stable URI-style chunk identifier used in JSONL and as HDF5 attribute."""
     return f"ts://{file_path}#{chunk_name}"
+
+
+def _chunk_id_to_hdf5_key(file_path: str, chunk_name: str) -> str:
+    """
+    Convert a chunk's file path + name into a valid HDF5 dataset path.
+
+    FIX: the chunk_id (ts://path/file.ts#name) cannot be used directly as an
+    HDF5 dataset name. h5py treats '/' as a path separator, so '://' produces
+    an empty path component that raises ValueError. '#' is technically legal but
+    confusing. Instead we build a clean hierarchical key from the parts we
+    already have: 'path/to/file.ts/chunk_name'.
+    The original chunk_id URI is stored as a dataset attribute for round-tripping.
+    """
+    # Normalise any backslashes (Windows paths) and strip leading slashes
+    safe_file = file_path.replace('\\', '/').lstrip('/')
+    safe_name = chunk_name.replace('/', '_')   # chunk names should never have '/' but guard anyway
+    return f"{safe_file}/{safe_name}"
 
 
 def append_jsonl_output(chunks: list[dict], output_path: Path):
@@ -305,19 +339,24 @@ def write_hdf5_output(all_chunks: list[dict], hdf5_path: Path, capsule_name: str
     """
     Write all chunks to HDF5.
 
-    FIX: h5py.special_dtype(vlen=str) is deprecated since h5py 3.x.
-         Use h5py.string_dtype() instead to avoid DeprecationWarning noise.
+    Each dataset is keyed by a clean hierarchical path (file/chunk_name) and
+    stores the condensed TypeScript code as a UTF-8 string. The full chunk_id
+    URI is preserved as a dataset attribute so consumers can correlate records
+    back to the JSONL embeddings file.
     """
     str_dtype = h5py.string_dtype()
     with h5py.File(hdf5_path, 'w') as h5f:
         capsule_group = h5f.create_group(f'capsule/{capsule_name}')
         for chunk in all_chunks:
-            chunk_id = generate_chunk_id(chunk['file'], chunk['chunk_name'])
-            capsule_group.create_dataset(
-                chunk_id,
+            hdf5_key = _chunk_id_to_hdf5_key(chunk['file'], chunk['chunk_name'])
+            chunk_id  = generate_chunk_id(chunk['file'], chunk['chunk_name'])
+            ds = capsule_group.create_dataset(
+                hdf5_key,
                 data=chunk['code'].encode('utf-8'),
                 dtype=str_dtype,
             )
+            # Store the URI so readers can join against the JSONL embeddings file.
+            ds.attrs['chunk_id'] = chunk_id
 
 
 def post_process_output(output_path: Path) -> list[str]:
@@ -428,7 +467,7 @@ def main():
         for e in errors:
             print(f'  ✗ {e}')
     print(f'Outputs:')
-    print(f'  MD (backup):      {OUTPUT_PATH}')
+    print(f'  MD (backup):        {OUTPUT_PATH}')
     print(f'  JSONL (embeddings): {jsonl_path}')
     print(f'  HDF5 (code):        {hdf5_path}')
 
